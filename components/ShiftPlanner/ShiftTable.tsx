@@ -5,6 +5,8 @@ import ShiftDropdown, { ShiftType } from './ShiftDropdown';
 import { employeesData } from "../../data/employees";
 import { Employee } from '../../types';
 import Notification from './Notification';
+import { ShiftData, saveEmployeeShifts, fetchAllShifts, fetchEmployees, saveAllShifts, saveEmployees } from '../../lib/shift-service';
+import supabase from '../../lib/supabase';
 
 interface ShiftData {
   [employeeId: string]: {
@@ -27,22 +29,125 @@ const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     const [savedShifts, setSavedShifts] = useState<ShiftData>({});
     const [changedEmployees, setChangedEmployees] = useState<Set<string>>(new Set());
     const [notification, setNotification] = useState<{type: NotificationType; message: string}>({type: null, message: ''});
+    const [isLoading, setIsLoading] = useState(true);
+    const [isSaving, setIsSaving] = useState(false);
 
-    const handleAddEmployee = (newEmployee: Employee) => {
-        setEmployees([...employees, newEmployee]);
+    const handleAddEmployee = async (newEmployee: Employee) => {
+        setIsSaving(true);
+        try {
+            // Save the new employee to Supabase
+            const { success, error } = await saveEmployees([...employees, newEmployee]);
+
+            if (!success) {
+                throw new Error(error);
+            }
+
+            setEmployees([...employees, newEmployee]);
+
+            setNotification({
+                type: 'success',
+                message: `${newEmployee.name} added successfully.`
+            });
+        } catch (error: any) {
+            setNotification({
+                type: 'error',
+                message: `Failed to add employee: ${error.message}`
+            });
+            console.error('Error adding employee:', error);
+        } finally {
+            setIsSaving(false);
+        }
     };
 
-    const handleRemoveEmployee = (employeeId: string) => {
-        // Remove employee from the list
-        setEmployees(employees.filter(emp => emp.id !== employeeId));
+    // Fetch data from Supabase on component mount
+    useEffect(() => {
+        const fetchData = async () => {
+            setIsLoading(true);
+            try {
+                // Fetch employees
+                const { data: employeesData, error: employeesError } = await fetchEmployees();
+                if (employeesError) {
+                    throw new Error(employeesError);
+                }
 
-        // Remove employee's shift data
-        const newShifts = {...shifts};
-        delete newShifts[employeeId];
-        setShifts(newShifts);
+                if (employeesData) {
+                    setEmployees(employeesData);
+                }
+
+                // Fetch all shifts
+                const { data: shiftsData, error: shiftsError } = await fetchAllShifts();
+                if (shiftsError) {
+                    throw new Error(shiftsError);
+                }
+
+                if (shiftsData) {
+                    setShifts(shiftsData);
+                    setSavedShifts(shiftsData);
+                }
+
+            } catch (error) {
+                console.error('Error loading data:', error);
+                setNotification({
+                    type: 'error',
+                    message: 'Failed to load data from the server.'
+                });
+            } finally {
+                setIsLoading(false);
+            }
+        };
+
+        fetchData();
+    }, []);
+
+    const handleRemoveEmployee = async (employeeId: string) => {
+        const employeeName = employees.find(emp => emp.id === employeeId)?.name || 'Employee';
+
+        setIsSaving(true);
+        try {
+            // Remove employee from database by saving the filtered list
+            const updatedEmployees = employees.filter(emp => emp.id !== employeeId);
+            const { success, error } = await saveEmployees(updatedEmployees);
+
+            if (!success) {
+                throw new Error(error);
+            }
+
+            // Remove employee from the list
+            setEmployees(updatedEmployees);
+
+            // Remove employee's shift data
+            const newShifts = {...shifts};
+            delete newShifts[employeeId];
+            setShifts(newShifts);
+
+            // Also remove from saved shifts
+            const newSavedShifts = {...savedShifts};
+            delete newSavedShifts[employeeId];
+            setSavedShifts(newSavedShifts);
+
+            // Delete employee's shifts from database
+            await supabase
+                .from('shifts')
+                .delete()
+                .eq('employee_id', employeeId);
+
+            setNotification({
+                type: 'success',
+                message: `${employeeName} removed successfully.`
+            });
+        } catch (error: any) {
+            setNotification({
+                type: 'error',
+                message: `Failed to remove ${employeeName}: ${error.message}`
+            });
+            console.error('Error removing employee:', error);
+        } finally {
+            setIsSaving(false);
+        }
     };
 
     const handleShiftChange = (employeeId: string, day: string, shift: ShiftType) => {
+        // Update shifts data
         setShifts(prev => {
             const newShifts = {...prev};
             if (!newShifts[employeeId]) {
@@ -51,43 +156,13 @@ const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
             newShifts[employeeId][day] = shift;
             return newShifts;
         });
-        // Mark this employee as having unsaved changes
+
+        // Always mark this employee as having unsaved changes when any shift is changed
+        // This ensures the save button is enabled even when modifying existing shifts
         setChangedEmployees(prev => new Set([...prev, employeeId]));
     };
 
-    // Track which employees have changes
-    useEffect(() => {
-        const updatedChangedEmployees = new Set<string>();
-
-        Object.keys(shifts).forEach(employeeId => {
-            const employeeShifts = shifts[employeeId];
-            const savedEmployeeShifts = savedShifts[employeeId] || {};
-
-            // Check if the shifts are different
-            const daysKeys = new Set([...Object.keys(employeeShifts), ...Object.keys(savedEmployeeShifts)]);
-            let hasChanges = false;
-
-            for (const day of daysKeys) {
-                if (employeeShifts[day] !== savedEmployeeShifts[day]) {
-                    hasChanges = true;
-                    break;
-                }
-            }
-
-            if (hasChanges) {
-                updatedChangedEmployees.add(employeeId);
-            }
-        });
-
-        // Check for employees that were in savedShifts but might have been removed in shifts
-        Object.keys(savedShifts).forEach(employeeId => {
-            if (!shifts[employeeId]) {
-                updatedChangedEmployees.add(employeeId);
-            }
-        });
-
-        setChangedEmployees(updatedChangedEmployees);
-    }, [shifts, savedShifts]);
+    // We now mark changes directly in handleShiftChange rather than using this effect
 
     // Validate max 5 shifts per employee
     const validateSchedule = (): ValidationResult => {
@@ -116,7 +191,7 @@ const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     };
 
     // Handle save for specific employee
-    const handleSaveEmployeeShifts = (employeeId: string) => {
+    const handleSaveEmployeeShifts = async (employeeId: string) => {
         // First validate all shifts
         const validation = validateSchedule();
         const employeeName = employees.find(emp => emp.id === employeeId)?.name || 'Employee';
@@ -139,34 +214,55 @@ const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
             }
         }
 
-        // Update saved shifts for this employee
-        setSavedShifts(prev => ({
-            ...prev,
-            [employeeId]: {...(shifts[employeeId] || {})}
-        }));
+        setIsSaving(true);
+        try {
+            // Save this employee's shifts to Supabase
+            const { success, error } = await saveEmployeeShifts(
+                employeeId,
+                shifts[employeeId] || {}
+            );
 
-        // Clear change status for this employee
-        setChangedEmployees(prev => {
-            const newSet = new Set([...prev]);
-            newSet.delete(employeeId);
-            return newSet;
-        });
+            if (!success) {
+                throw new Error(error);
+            }
 
-        // Show appropriate notification
-        if (hasIncompleteSchedule) {
-            const warningMessage = `${employeeName} has incomplete shifts. Some days don't have assignments.`;
-            setNotification({
-                type: 'warning',
-                message: warningMessage
+            // Update saved shifts locally
+            setSavedShifts(prev => ({
+                ...prev,
+                [employeeId]: {...(shifts[employeeId] || {})}
+            }));
+
+            // Clear change status for this employee
+            setChangedEmployees(prev => {
+                const newSet = new Set([...prev]);
+                newSet.delete(employeeId);
+                return newSet;
             });
-            console.warn(warningMessage, shifts[employeeId]);
-        } else {
-            const successMessage = `${employeeName}'s schedule saved successfully.`;
+
+            // Show appropriate notification
+            if (hasIncompleteSchedule) {
+                const warningMessage = `${employeeName} has incomplete shifts. Some days don't have assignments.`;
+                setNotification({
+                    type: 'warning',
+                    message: warningMessage
+                });
+                console.warn(warningMessage, shifts[employeeId]);
+            } else {
+                const successMessage = `${employeeName}'s schedule saved successfully.`;
+                setNotification({
+                    type: 'success',
+                    message: successMessage
+                });
+                console.log(successMessage, shifts[employeeId]);
+            }
+        } catch (error: any) {
             setNotification({
-                type: 'success',
-                message: successMessage
+                type: 'error',
+                message: `Failed to save ${employeeName}'s shifts: ${error.message}`
             });
-            console.log(successMessage, shifts[employeeId]);
+            console.error('Error saving shifts:', error);
+        } finally {
+            setIsSaving(false);
         }
     };
 
@@ -175,13 +271,14 @@ const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
         // Get all days for this employee
         const employeeShifts = shifts[employeeId] || {};
         // Check if any day is missing a shift assignment
-        return days.some(day => !employeeShifts[day]);
+        return days.some(day => !employeeShifts[day] || employeeShifts[day] === ShiftType.NONE);
     };
 
     // Close notification
     const closeNotification = () => {
         setNotification({type: null, message: ''});
     };
+
 
     return (
         <div className="min-h-screen w-full bg-gradient-to-br from-gray-100 to-white relative">
@@ -202,11 +299,17 @@ const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
                     employees={employees} 
                     onAddEmployee={handleAddEmployee} 
                     onRemoveEmployee={handleRemoveEmployee} 
+                    isLoading={isSaving}
                 />
 
                 {/* Table */}
                 <main className="flex-1 flex justify-center items-start p-8 pb-20 overflow-auto">
                 <div className="w-full max-w-7xl bg-white border border-gray-300 rounded-2xl shadow-xl overflow-x-auto">
+                    {isLoading ? (
+                        <div className="flex justify-center items-center h-64">
+                            <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500"></div>
+                        </div>
+                    ) : (
                     <table className="w-full table-fixed text-base text-center text-gray-700">
                         <thead className="bg-gray-100 text-gray-600 uppercase text-sm tracking-wide">
                         <tr>
@@ -230,17 +333,18 @@ const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
                                     </div>
                                     <button
                                         onClick={() => handleSaveEmployeeShifts(emp.id)}
-                                        disabled={!changedEmployees.has(emp.id)}
-                                        className={`text-xs px-2 py-1 rounded ${changedEmployees.has(emp.id) ? 'bg-blue-500 text-white hover:bg-blue-600' : 'bg-gray-200 text-gray-500'} transition-colors focus:outline-none`}
+                                        disabled={!changedEmployees.has(emp.id) || isSaving}
+                                        className={`text-xs px-2 py-1 rounded ${changedEmployees.has(emp.id) && !isSaving ? 'bg-blue-500 text-white hover:bg-blue-600' : 'bg-gray-200 text-gray-500'} transition-colors focus:outline-none`}
                                     >
-                                        Save
+                                        {isSaving && changedEmployees.has(emp.id) ? 'Saving...' : changedEmployees.has(emp.id) ? 'Save' : 'Saved'}
                                     </button>
                                 </td>
                                 {days.map((day) => (
                                     <td key={day} className="py-5 px-6 border-b border-gray-200">
                                         <ShiftDropdown
-                                            value={shifts[emp.id]?.[day] || null}
+                                            value={shifts[emp.id]?.[day] || ShiftType.NONE}
                                             onChange={(shift) => handleShiftChange(emp.id, day, shift)}
+                                            disabled={isSaving}
                                         />
                                     </td>
                                 ))}
@@ -248,6 +352,7 @@ const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
                         ))}
                         </tbody>
                     </table>
+                    )}
                 </div>
                 </main>
             </div>

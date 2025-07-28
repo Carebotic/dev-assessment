@@ -7,11 +7,11 @@ interface NotificationProps {
 }
 
 const Notification: React.FC<NotificationProps> = ({ type, message, onClose }) => {
-  // Auto-close after 5 seconds
+  // Auto-close after 3 seconds
   useEffect(() => {
     const timer = setTimeout(() => {
       onClose();
-    }, 5000);
+    }, 3000);
 
     return () => clearTimeout(timer);
   }, [onClose]);
